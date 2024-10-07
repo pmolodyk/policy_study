@@ -1,88 +1,52 @@
-# Based on MaskGIT codebase https://github.com/google-research/maskgit/blob/main/maskgit/nets/maskgit_transformer.py
+# Based on MaskGIT codebase:
+# https://github.com/google-research/maskgit/blob/main/maskgit/nets/maskgit_transformer.py
+# https://github.com/dome272/MaskGIT-pytorch/blob/main/bidirectional_transformer.py
 
 from typing import Any, Callable, Dict, Iterable, Optional, Text, Tuple, Union
 
-from flax import linen as nn
-import jax
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
 
 
 LAYERNORM_EPSILON = 1e-12  # Layer norm from BERT
 
-InitializerType = Callable[[jnp.ndarray, Iterable[int], jnp.dtype], jnp.ndarray]
-
-
-def truncated_normal(stddev: Union[float, jnp.ndarray], dtype=jnp.float32):
-
-  def init(key: jnp.ndarray, shape: Iterable[int], dtype: jnp.dtype = dtype):
-    return jax.random.truncated_normal(
-        key=key, lower=-2, upper=2, shape=shape, dtype=dtype) * stddev
-
-  return init
-
-
 class Attention(nn.Module):
-  """Attention layer that is part of each Transformer layer."""
-  hidden_size: int
-  hidden_dropout_prob: float
-  num_attention_heads: int
-  attention_probs_dropout_prob: float
-  hidden_dropout_prob: float
-  initializer_fn: InitializerType
+    """Attention layer that is part of each Transformer layer."""
 
-  @nn.compact
-  def __call__(self, layer_input: jnp.ndarray, input_mask: jnp.ndarray,
-               deterministic: bool) -> jnp.ndarray:
-    attention_mask = nn.make_attention_mask(input_mask, input_mask)
-    attention_output = nn.attention.SelfAttention(
-        num_heads=self.num_attention_heads,
-        qkv_features=self.hidden_size,
-        dropout_rate=self.attention_probs_dropout_prob,
-        deterministic=deterministic,
-        kernel_init=self.initializer_fn,
-        bias_init=jax.nn.initializers.zeros,
-        name='self_attention',
-    )(layer_input, attention_mask)
+    def __init__(self, 
+                 hidden_size: int,
+                 num_attention_heads: int,
+                 attention_probs_dropout_prob: float):
+      self.dim = hidden_size // num_attention_heads
+      self.q, self.k, self.v = nn.Linear(hidden_size, self.dim), nn.Linear(hidden_size, self.dim), nn.Linear(hidden_size, self.dim)
+      self.attention = nn.MultiheadAttention(num_heads=num_attention_heads,
+                                             embed_dim=hidden_size,
+                                             dropout=attention_probs_dropout_prob)
+      
 
-    attention_output = nn.Dropout(rate=self.hidden_dropout_prob)(
-        attention_output, deterministic=deterministic)
-    attention_output = nn.LayerNorm(
-        epsilon=LAYERNORM_EPSILON, name='attention_output_ln')(
-            attention_output + layer_input)
+    def forward(self, x):
+        # TODO: need to build the required mask, missing in PyTorch impl
+        attention_output = self.attention(query=self.q(x), key=self.k(x), value=self.v(x))
 
-    return attention_output
+        return attention_output
 
 
 class Mlp(nn.Module):
-  """MLP layer that is part of each Transformer layer."""
-  hidden_size: int
-  hidden_dropout_prob: float
-  intermediate_size: int
-  initializer_fn: InitializerType
-
-  @nn.compact
-  def __call__(self, attention_output: jnp.ndarray,
-               deterministic: bool) -> jnp.ndarray:
-    intermediate_output = nn.Dense(
-        features=self.intermediate_size,
-        kernel_init=self.initializer_fn,
-        name='intermediate_output')(
-            attention_output)
-    intermediate_output = jax.nn.gelu(intermediate_output)
-
-    layer_output = nn.Dense(
-        features=self.hidden_size,
-        kernel_init=self.initializer_fn,
-        name='layer_output')(
-            intermediate_output)
-    layer_output = nn.Dropout(rate=self.hidden_dropout_prob)(
-        layer_output, deterministic=deterministic)
-    layer_output = nn.LayerNorm(
-        epsilon=LAYERNORM_EPSILON, name='layer_output_ln')(
-            layer_output + attention_output)
-
-    return layer_output
-
+    # MLP layer that is part of each Transformer layer
+    def __init__(self,
+                 intermediate_dim,
+                 hidden_dim,
+                 mlp_dropout_p):
+        self.l1 = nn.Linear(hidden_dim, intermediate_dim)
+        self.act1 = nn.GELU()
+        self.l2 = nn.Linear(intermediate_dim, hidden_dim)
+        self.dropout = nn.Dropout(mlp_dropout_p)
+        self.layer_norm = nn.LayerNorm(hidden_dim, eps=LAYERNORM_EPSILON)
+    
+    def forward(self, x):
+       layer1_output = self.act1(self.l1(x))
+       layer2_output = self.dropout(self.l2(layer1_output))
+       return self.layer_norm(layer2_output + x)
 
 class TransformerLayer(nn.Module):
   """A single Transformer layer."""
