@@ -1,9 +1,6 @@
 # Based on MaskGIT codebase:
 # https://github.com/google-research/maskgit/blob/main/maskgit/nets/maskgit_transformer.py
 # https://github.com/dome272/MaskGIT-pytorch/blob/main/bidirectional_transformer.py
-
-from typing import Any, Callable, Dict, Iterable, Optional, Text, Tuple, Union
-
 import torch
 import torch.nn as nn
 
@@ -14,20 +11,18 @@ class Attention(nn.Module):
     """Attention layer that is part of each Transformer layer."""
 
     def __init__(self, 
-                 hidden_size: int,
+                 hidden_dim: int,
                  num_attention_heads: int,
                  attention_probs_dropout_prob: float):
-      self.dim = hidden_size // num_attention_heads
-      self.q, self.k, self.v = nn.Linear(hidden_size, self.dim), nn.Linear(hidden_size, self.dim), nn.Linear(hidden_size, self.dim)
+      self.dim = hidden_dim // num_attention_heads
+      self.q, self.k, self.v = nn.Linear(hidden_dim, self.dim), nn.Linear(hidden_dim, self.dim), nn.Linear(hidden_dim, self.dim)
       self.attention = nn.MultiheadAttention(num_heads=num_attention_heads,
-                                             embed_dim=hidden_size,
+                                             embed_dim=hidden_dim,
                                              dropout=attention_probs_dropout_prob)
       
 
-    def forward(self, x):
-        # TODO: need to build the required mask, missing in PyTorch impl
-        attention_output = self.attention(query=self.q(x), key=self.k(x), value=self.v(x))
-
+    def forward(self, x, attn_mask):
+        attention_output = self.attention(query=self.q(x), key=self.k(x), value=self.v(x), attn_mask=attn_mask)
         return attention_output
 
 
@@ -49,177 +44,98 @@ class Mlp(nn.Module):
        return self.layer_norm(layer2_output + x)
 
 class TransformerLayer(nn.Module):
-  """A single Transformer layer."""
-  intermediate_size: int
-  hidden_size: int
-  hidden_dropout_prob: float
-  num_attention_heads: int
-  attention_probs_dropout_prob: float
-  initializer_fn: InitializerType
-
-  @nn.compact
-  def __call__(self, layer_input: jnp.ndarray, input_mask: jnp.ndarray,
-               deterministic: bool) -> jnp.ndarray:
-    attention_output = Attention(
-        hidden_size=self.hidden_size,
-        hidden_dropout_prob=self.hidden_dropout_prob,
-        num_attention_heads=self.num_attention_heads,
-        attention_probs_dropout_prob=self.attention_probs_dropout_prob,
-        initializer_fn=self.initializer_fn)(
-            layer_input=layer_input,
-            input_mask=input_mask,
-            deterministic=deterministic)
-
-    layer_output = Mlp(
-        hidden_size=self.hidden_size,
-        hidden_dropout_prob=self.hidden_dropout_prob,
-        intermediate_size=self.intermediate_size,
-        initializer_fn=self.initializer_fn)(
-            attention_output=attention_output, deterministic=deterministic)
-
-    return layer_output
+    def __init__(self,
+                 intermediate_dim,
+                 hidden_dim,
+                 mlp_dropout_prob,
+                 attn_dropout_prob,
+                 num_attn_heads):
+       self.attention = Attention(hidden_dim=hidden_dim,
+                                  num_attention_heads=num_attn_heads,
+                                  attention_probs_dropout_prob=attn_dropout_prob)
+       self.mlp = Mlp(intermediate_dim=intermediate_dim,
+                      hidden_dim=hidden_dim,
+                      mlp_dropout_p=mlp_dropout_prob)
+    
+    def forward(self, x, attn_mask):
+        attention_output = self.attention(x, attn_mask)
+        layer_output = self.mlp(attention_output)
+        return layer_output
 
 
-class Embed(nn.Module):
-  """Embeds visual tokens."""
-  embedding_size: int
-  hidden_dropout_prob: float
-  vocab_size: int
-  max_position_embeddings: int
-  initializer_fn: InitializerType
-  hidden_size: Optional[int] = None
+class Embedding(nn.Module):
+    def __init__(self,
+                 embedding_dim,
+                 vocab_size,
+                 max_pos_embed,
+                 dropout_p):
+        self.input_embedding = nn.Embedding(num_embeddings=vocab_size,
+                                            embedding_dim=embedding_dim)
+        self.positional_embedding = nn.Embedding(num_embeddings=max_pos_embed,
+                                                 embedding_dim=embedding_dim)
+        self.dropout = nn.Dropout(p=dropout_p)
+        self.layer_norm = nn.LayerNorm(embedding_dim, eps=LAYERNORM_EPSILON)
+    
+    def forward(self, x):
+       content_embeddings = self.input_embedding(x)
+       position_ids = torch.range(x.shape[-1]).unsqueeze(0)
+       position_embeddings = self.positional_embedding(position_ids)
 
-  @nn.compact
-  def __call__(self, input_ids: jnp.ndarray,
-               deterministic: bool) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    seq_length = input_ids.shape[-1]
-    position_ids = jnp.arange(seq_length)[None, :]
+       input_embeddings = self.layer_norm(content_embeddings + position_embeddings)
+       embedded_output = self.dropout(input_embeddings)
+       
+       return embedded_output
 
-    word_embedder = nn.Embed(
-        num_embeddings=self.vocab_size,
-        features=self.embedding_size,
-        embedding_init=self.initializer_fn,
-        name='word_embeddings')
-    word_embeddings = word_embedder(input_ids)
-    position_embeddings = nn.Embed(
-        num_embeddings=self.max_position_embeddings,
-        features=self.embedding_size,
-        embedding_init=self.initializer_fn,
-        name='position_embeddings')(
-            position_ids)
-
-    input_embeddings = nn.LayerNorm(
-        epsilon=LAYERNORM_EPSILON, name='embeddings_ln')(
-            word_embeddings + position_embeddings)
-    if self.hidden_size:
-      input_embeddings = nn.Dense(
-          features=self.hidden_size,
-          kernel_init=self.initializer_fn,
-          name='embedding_hidden_mapping')(
-              input_embeddings)
-    input_embeddings = nn.Dropout(rate=self.hidden_dropout_prob)(
-        input_embeddings, deterministic=deterministic)
-
-    return input_embeddings
-
-
-class Bias(nn.Module):
-  """Adds a learnable bias to the input.
-
-  Attributes:
-    dtype: the dtype of the computation (default: float32).
-    bias_init: initializer function for the bias.
-  """
-  dtype: Any = jnp.float32
-  bias_init: Callable[[Any, Tuple[int], Any], Any] = nn.initializers.zeros
-
-  @nn.compact
-  def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
-    """Applies a linear transformation to the inputs along the last dimension.
-
-    Args:
-      inputs: The nd-array to be transformed.
-
-    Returns:
-      The transformed input.
-    """
-    inputs = jnp.asarray(inputs, self.dtype)
-
-    bias_shape = inputs.shape[-1]
-    bias = self.param('bias', self.bias_init, bias_shape)
-    bias = jnp.asarray(bias, self.dtype)
-    bias = jnp.broadcast_to(bias, inputs.shape)
-
-    return inputs + bias
-
+class BiasLayer(torch.nn.Module):
+    def __init__(self):
+        self.bias_param = torch.nn.Parameter(torch.zeros((1)))
+    
+    def forward(self, x):
+        return x + self.bias_param
 
 class MlmLayer(nn.Module):
-  """MLM layer for masked token prediction."""
-  hidden_size: int
-  initializer_fn: InitializerType
-
-  @nn.compact
-  def __call__(self, last_layer: jnp.ndarray,
-               embeddings: jnp.ndarray) -> jnp.ndarray:
-    mlm_hidden = nn.Dense(
-        features=self.hidden_size,
-        kernel_init=self.initializer_fn,
-        name='mlm_dense')(
-            last_layer)
-    mlm_hidden = jax.nn.gelu(mlm_hidden)
-    mlm_hidden = nn.LayerNorm(
-        epsilon=LAYERNORM_EPSILON, name='mlm_ln')(
-            mlm_hidden)
-    output_weights = jnp.transpose(embeddings)
-    logits = jnp.matmul(mlm_hidden, output_weights)
-    logits = Bias(name='mlm_bias')(logits)
-    return logits
-
+    """MLM layer for masked token prediction."""
+    def __init__(self, hidden_dim):
+        self.layer = nn.Linear()
+        self.act = nn.GELU()
+        self.bias = BiasLayer()
+        self.layer_norm = nn.LayerNorm(hidden_dim, eps=LAYERNORM_EPSILON)
+    
+    def forward(self, x, embedding_table):
+       layer_output = self.layer_norm(self.act(self.layer(x)))
+       logits = self.bias(layer_output @ embedding_table.T)
+       return logits
 
 class Transformer(nn.Module):
-  """Transformer modified from BERT."""
-  vocab_size: int
-  hidden_size: int = 768
-  num_hidden_layers: int = 12
-  num_attention_heads: int = 12
-  intermediate_size: int = 3072
-  hidden_dropout_prob: float = 0.1
-  attention_probs_dropout_prob: float = 0.1
-  max_position_embeddings: int = 256
-  initializer_range: float = 0.02
+    def __init__(self,
+                vocab_size,
+                hidden_dim = 768,
+                num_hidden_layers = 12,
+                num_attention_heads = 12,
+                intermediate_dim = 3072,
+                mlp_dropout_prob = 0.1,
+                attn_dropout_prob = 0.1,
+                max_position_embed = 256):
+        self.embedding = Embedding(embedding_dim=hidden_dim,
+                                  vocab_size=vocab_size,
+                                  max_pos_embed=max_position_embed,
+                                  dropout_p=mlp_dropout_prob)
+        self.transformer_layers = []
+        for _ in range(num_hidden_layers):
+            self.transformer_layers.append(TransformerLayer(intermediate_dim=intermediate_dim,
+                                                            hidden_dim=hidden_dim,
+                                                            mlp_dropout_prob=mlp_dropout_prob,
+                                                            attn_dropout_prob=attn_dropout_prob,
+                                                            num_attn_heads=num_attention_heads))
+        self.mlm = MlmLayer(hidden_dim=hidden_dim)
+    
+    def forward(self, input_ids):
+        layer_input = self.embedding(input_ids)
 
-  @nn.compact
-  def __call__(self,
-               input_ids: jnp.ndarray,
-               deterministic: bool = True) -> Dict[Text, jnp.ndarray]:
-    input_ids = input_ids.astype('int32')
-    input_embeddings = Embed(
-        embedding_size=self.hidden_size,
-        hidden_dropout_prob=self.hidden_dropout_prob,
-        vocab_size=self.vocab_size,
-        max_position_embeddings=self.max_position_embeddings,
-        initializer_fn=truncated_normal(self.initializer_range))(
-            input_ids=input_ids, deterministic=deterministic)
+        for transformer_layer in self.transformer_layers:
+            layer_input = transformer_layer(layer_input, attn_mask = torch.ones(layer_input.shape, dtype=torch.int32))
+        
+        embedding_table = self.embedding.weight.data
+        logits = self.mlm(layer_input, embedding_table=embedding_table)
 
-    layer_input = input_embeddings
-    for _ in range(self.num_hidden_layers):
-      layer_output = TransformerLayer(
-          intermediate_size=self.intermediate_size,
-          hidden_size=self.hidden_size,
-          hidden_dropout_prob=self.hidden_dropout_prob,
-          num_attention_heads=self.num_attention_heads,
-          attention_probs_dropout_prob=self.attention_probs_dropout_prob,
-          initializer_fn=truncated_normal(self.initializer_range))(
-              layer_input=layer_input,
-              input_mask=jnp.ones_like(input_ids, dtype=jnp.int32),
-              deterministic=deterministic)
-      layer_input = layer_output
-
-    word_embedding_matrix = self.variables['params']['Embed_0'][
-        'word_embeddings']['embedding']
-    logits = MlmLayer(
-        hidden_size=self.hidden_size,
-        initializer_fn=truncated_normal(self.initializer_range))(
-            last_layer=layer_output, embeddings=word_embedding_matrix)
-
-    return logits
+        return logits
