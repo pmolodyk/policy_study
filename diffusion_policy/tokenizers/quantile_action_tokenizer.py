@@ -14,6 +14,7 @@ class QuantileActionTokenizer(BaseActionTokenizer):
         self.min_q = min_q
         self.max_q = max_q
         self.num_bins = self.vocab_size - self.NUM_SPECIAL_TOKENS # Active bins for tokens
+        self.bin_widths = None
     
     # Fit to training data
     def fit(self, action_sequences):
@@ -31,7 +32,8 @@ class QuantileActionTokenizer(BaseActionTokenizer):
         assert(len(action_sequence.shape) == 3) # Must be (B x SeqLen x action_dim)
         assert(action_sequence.shape[-1] == self.action_dim)
 
-        encoded_sequence = torch.floor((action_sequence - self.min_quants[None, None, :]) / self.bin_widths[None, None, :])
+        device = action_sequence.device
+        encoded_sequence = torch.floor((action_sequence - self.min_quants[None, None, :].to(device)) / self.bin_widths[None, None, :].to(device))
 
         return encoded_sequence
     
@@ -40,6 +42,7 @@ class QuantileActionTokenizer(BaseActionTokenizer):
         assert(len(token_sequence.shape) == 3) # Must be (B x SeqLen x action_dim)
         assert(token_sequence.shape[-1] == self.action_dim)
 
-        decoded_sequence = token_sequence * self.bin_widths[None, None, :] + self.min_quants[None, None, :]
+        device = token_sequence.device
+        decoded_sequence = token_sequence * self.bin_widths[None, None, :].to(device) + self.min_quants[None, None, :].to(device)
 
         return decoded_sequence

@@ -95,6 +95,11 @@ class TrainAutoregressiveTransformerHybridWorkspace(BaseWorkspace):
             last_epoch=self.global_step-1
         )
 
+        # Fit model tokenizer
+        self.model.fit_tokenizer(dataset=dataset)
+        if cfg.training.use_ema:
+            self.ema_model.tokenizer = copy.deepcopy(self.model.tokenizer)
+
         # configure ema
         ema: EMAModel = None
         if cfg.training.use_ema:

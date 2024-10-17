@@ -3,12 +3,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from einops import rearrange, reduce
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
-from diffusion_policy.model.diffusion.transformer_for_diffusion import TransformerForDiffusion
+from diffusion_policy.model.diffusion.autoregressive_transformer import AutoregressiveTransformer
 from diffusion_policy.model.diffusion.mask_generator import LowdimMaskGenerator
 from diffusion_policy.common.robomimic_config_util import get_robomimic_config
 from robomimic.algo import algo_factory
@@ -145,11 +146,11 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
 
         # create diffusion model
         obs_feature_dim = obs_encoder.output_shape()[0]
-        input_dim = action_dim * n_action_steps if obs_as_cond else (obs_feature_dim + action_dim)
-        output_dim = action_dim * actions_vocab_size * n_action_steps
+        input_dim = action_dim if obs_as_cond else (obs_feature_dim + action_dim)
+        output_dim = action_dim * actions_vocab_size
         cond_dim = obs_feature_dim if obs_as_cond else 0
 
-        model = TransformerForDiffusion(
+        model = AutoregressiveTransformer(
             input_dim=input_dim,
             output_dim=output_dim,
             horizon=horizon,
@@ -191,13 +192,13 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
-        self.ce_loss = torch.nn.CrossEntropyLoss()
+        self.ce_loss = torch.nn.CrossEntropyLoss(reduction='none')
 
     # Sample next action autoregressively TODO check
     def sample_token(self, model_output):
-        probabilities = F.softmax(model_output / self.temperature, dim=-1).flatten(0, 1) # (B * dim, Vocab)
+        probabilities = F.softmax(model_output / self.temperature, dim=-1).flatten(0, 2) # (B * seq_len * dim, Vocab)
         next_tokens = torch.multinomial(probabilities, 1) # B * 1
-        return next_tokens
+        return next_tokens.reshape(model_output.shape[:-1])
     
     # ========= inference  ============
     def conditional_sample(self, 
@@ -211,11 +212,16 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
         trajectory = self.generate_start_trajectory(size=condition_data.shape, 
                                                     dtype=condition_data.dtype,
                                                     device=condition_data.device)
+        device = trajectory.device
         for a in range(self.n_action_steps):
             for d in range(self.action_dim):
-                model_output = model(trajectory, a*self.action_dim+d, cond).reshape(condition_data.shape[0], self.action_dim, self.actions_vocab_size)
-                next_token = self.sample_token(model_output)
-                trajectory[:, a, d] = next_token
+                model_output = model(trajectory, torch.zeros(trajectory.shape[0], device=device), cond)
+                # print('OUTPUT', model_output.shape)
+                # print('COND', condition_data.shape)
+                # print('TRAJ', trajectory[:, a, d].shape)
+                next_token = self.sample_token(model_output.reshape(condition_data.shape[0], condition_data.shape[1], self.action_dim, self.actions_vocab_size))
+                # print('NEXT', next_token.shape)
+                trajectory[:, a, d] = next_token[:, a, d]
 
         return trajectory
 
@@ -320,7 +326,6 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
         batch_size = nactions.shape[0]
-        horizon = nactions.shape[1]
         To = self.n_obs_steps
 
         # handle different ways of passing observation
@@ -334,40 +339,25 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
-                start = To - 1
-                end = start + self.n_action_steps
-                trajectory = nactions[:,start:end]
+                raise NotImplementedError()
+                # start = To - 1
+                # end = start + self.n_action_steps
+                # trajectory = nactions[:,start:end]
         else:
             raise NotImplementedError()
 
-        # generate impainting mask
-        if self.pred_action_steps_only:
-            condition_mask = torch.zeros_like(trajectory, dtype=torch.bool)
-        else:
-            condition_mask = self.mask_generator(trajectory.shape)
-
         bsz = trajectory.shape[0]
-        # Sample the action in the sequence to predict
-        action_nums = torch.randint(
-            0, horizon, 
-            (bsz,), device=trajectory.device
-        ).long()
-        # Sample the dimension to predict
-        dim_nums = torch.randint(
-            0, self.action_dim, 
-            (bsz,), device=trajectory.device
-        ).long()
-        # Mask the tokens for next-token prediction
-        maksed_trajectory = self.mask_trajectory(trajectory, action_nums, dim_nums)
         
         # Predict the noise residual
-        positional_condition = action_nums * self.action_dim + dim_nums # TODO review
-        model_output = self.model(maksed_trajectory, positional_condition, cond)
-        pred = F.softmax(model_output / self.temperature, dim=-1).flatten(0, 1) # (B * dim, Vocab)
-
+        # print('TRAJECTORY', trajectory.shape)
+        model_output = self.model(trajectory, torch.zeros(bsz, device=trajectory.device), cond) # TODO remove redundant t
+        # print('SIZE', model_output.shape)
+        pred = F.softmax(model_output, dim=-1).reshape(bsz, self.actions_vocab_size, model_output.shape[1], self.action_dim)
+        # print('PRED', pred.shape)
         # Select target tokens
-        target_tokens = trajectory[torch.arange(bsz), action_nums, dim_nums]
-        loss = self.ce_loss(input=pred, target=target_tokens, reduction='none')
+        target_tokens = trajectory.clone().long()
+        # print('TGT', target_tokens.shape)
+        loss = self.ce_loss(input=pred, target=target_tokens)
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = loss.mean()
         return loss
@@ -378,14 +368,25 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
     
     # Select the token to predict during training
     def mask_trajectory(self, trajectory, action_nums, dim_pos):
-        mask = torch.ones(trajectory.shape, device=trajectory.device)
+        device = trajectory.device
+        mask = torch.ones(trajectory.shape, device=device)
 
-        dim2 = torch.arange(trajectory.shape[2]).unsqueeze(0).expand(trajectory.shape[0], trajectory.shape[2])
+        dim2 = torch.arange(trajectory.shape[2]).unsqueeze(0).expand(trajectory.shape[0], trajectory.shape[2]).to(device)
         mask = mask.transpose(1, 2)
         mask[dim2 >= dim_pos.unsqueeze(1), :] = 0
         mask = mask.transpose(1, 2)
-        dim1 = torch.arange(trajectory.shape[1]).unsqueeze(0).expand(trajectory.shape[0], trajectory.shape[1])
+        dim1 = torch.arange(trajectory.shape[1]).unsqueeze(0).expand(trajectory.shape[0], trajectory.shape[1]).to(device)
         mask[dim1 > action_nums.unsqueeze(1), :] = 0
         mask[dim1 < action_nums.unsqueeze(1), :] = 1
 
         return trajectory * mask + self.tokenizer.EMPTY_ACTION_TOKEN * (1 - mask)
+    
+    # Fit tokenizer to dataset
+    def fit_tokenizer(self, dataset, learning_sample=-1):
+        # Select lower for memory reasons
+        if learning_sample == -1:
+            learning_sample = len(dataset)
+        dataloader = DataLoader(dataset=dataset, batch_size=learning_sample)
+        learning_data = self.normalizer['action'].normalize(next(iter(dataloader))['action'])
+        self.tokenizer.fit(learning_data)
+        print('TOKENIZER fitted!', self.tokenizer.bin_widths)
