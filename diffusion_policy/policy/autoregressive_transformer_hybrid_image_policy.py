@@ -19,6 +19,7 @@ import robomimic.models.base_nets as rmbn
 import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 from diffusion_policy.tokenizers.quantile_action_tokenizer import QuantileActionTokenizer
+from diffusion_policy.model.bet.libraries.loss_fn import FocalLoss, soft_cross_entropy
 
 START_TOKEN = -1 # TODO Setup encoding
 
@@ -162,7 +163,6 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
             p_drop_emb=p_drop_emb,
             p_drop_attn=p_drop_attn,
             causal_attn=causal_attn,
-            time_as_cond=time_as_cond,
             obs_as_cond=obs_as_cond,
             n_cond_layers=n_cond_layers
         )
@@ -193,11 +193,12 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
         self.ce_loss = torch.nn.CrossEntropyLoss(reduction='none')
+        self.criterion = FocalLoss()
 
     # Sample next action autoregressively TODO check
     def sample_token(self, model_output):
-        probabilities = F.softmax(model_output / self.temperature, dim=-1).flatten(0, 2) # (B * seq_len * dim, Vocab)
-        next_tokens = torch.multinomial(probabilities, 1) # B * 1
+        probabilities = F.softmax(model_output / self.temperature, dim=-1) # (B , seq_len , dim, Vocab)
+        next_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1) # B * 1
         return next_tokens.reshape(model_output.shape[:-1])
     
     # ========= inference  ============
@@ -215,12 +216,8 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
         device = trajectory.device
         for a in range(self.n_action_steps):
             for d in range(self.action_dim):
-                model_output = model(trajectory, torch.zeros(trajectory.shape[0], device=device), cond)
-                # print('OUTPUT', model_output.shape)
-                # print('COND', condition_data.shape)
-                # print('TRAJ', trajectory[:, a, d].shape)
+                model_output = model(trajectory, cond)
                 next_token = self.sample_token(model_output.reshape(condition_data.shape[0], condition_data.shape[1], self.action_dim, self.actions_vocab_size))
-                # print('NEXT', next_token.shape)
                 trajectory[:, a, d] = next_token[:, a, d]
 
         return trajectory
@@ -260,16 +257,7 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
             cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
             cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
         else:
-            # condition through impainting
-            this_nobs = dict_apply(nobs, lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
-            nobs_features = self.obs_encoder(this_nobs)
-            # reshape back to B, To, Do
-            nobs_features = nobs_features.reshape(B, To, -1)
-            shape = (B, T, Da+Do)
-            cond_data = torch.zeros(size=shape, device=device, dtype=dtype)
-            cond_mask = torch.zeros_like(cond_data, dtype=torch.bool)
-            cond_data[:,:To,Da:] = nobs_features
-            cond_mask[:,:To,Da:] = True
+            raise NotImplementedError()
 
         # run sampling
         nsample = self.conditional_sample(
@@ -281,9 +269,8 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         # Decode back to action-space
-        self.tokenizer.decode(naction_pred)
+        naction_pred = self.tokenizer.decode(naction_pred)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
-
         # get action
         if self.pred_action_steps_only:
             action = action_pred
@@ -340,9 +327,6 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
                 raise NotImplementedError()
-                # start = To - 1
-                # end = start + self.n_action_steps
-                # trajectory = nactions[:,start:end]
         else:
             raise NotImplementedError()
 
@@ -350,16 +334,12 @@ class AutoregressiveTransformerHybridImagePolicy(BaseImagePolicy):
         
         # Predict the noise residual
         # print('TRAJECTORY', trajectory.shape)
-        model_output = self.model(trajectory, torch.zeros(bsz, device=trajectory.device), cond) # TODO remove redundant t
+        # model_output = self.model(trajectory, cond)
+        model_output = self.model(trajectory, cond)
         # print('SIZE', model_output.shape)
-        pred = F.softmax(model_output, dim=-1).reshape(bsz, self.actions_vocab_size, model_output.shape[1], self.action_dim)
-        # print('PRED', pred.shape)
-        # Select target tokens
+        pred = model_output.reshape(bsz, model_output.shape[1], self.action_dim, self.actions_vocab_size)
         target_tokens = trajectory.clone().long()
-        # print('TGT', target_tokens.shape)
-        loss = self.ce_loss(input=pred, target=target_tokens)
-        loss = reduce(loss, 'b ... -> b (...)', 'mean')
-        loss = loss.mean()
+        loss = self.criterion(pred.view(-1, pred.size(-1)), target_tokens.view(-1))
         return loss
 
     def generate_start_trajectory(self, size, dtype, device):

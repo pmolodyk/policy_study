@@ -33,9 +33,9 @@ class QuantileActionTokenizer(BaseActionTokenizer):
         assert(action_sequence.shape[-1] == self.action_dim)
 
         device = action_sequence.device
-        encoded_sequence = torch.floor((action_sequence - self.min_quants[None, None, :].to(device)) / self.bin_widths[None, None, :].to(device))
+        encoded_sequence = torch.floor(action_sequence - self.min_quants[None, None, :].to(device) / self.bin_widths[None, None, :].to(device))
 
-        return encoded_sequence
+        return torch.clamp(encoded_sequence, 0, self.vocab_size - 1)
     
     # Decode token sequence back to actions
     def decode(self, token_sequence):

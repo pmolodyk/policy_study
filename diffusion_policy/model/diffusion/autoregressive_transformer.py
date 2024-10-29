@@ -20,7 +20,6 @@ class AutoregressiveTransformer(ModuleAttrMixin):
             p_drop_emb: float = 0.1,
             p_drop_attn: float = 0.1,
             causal_attn: bool=False,
-            time_as_cond: bool=True,
             obs_as_cond: bool=False,
             n_cond_layers: int = 0
         ) -> None:
@@ -31,13 +30,9 @@ class AutoregressiveTransformer(ModuleAttrMixin):
             n_obs_steps = horizon
         
         T = horizon
-        T_cond = 1
-        if not time_as_cond:
-            T += 1
-            T_cond -= 1
+        T_cond = 0
         obs_as_cond = cond_dim > 0
         if obs_as_cond:
-            assert time_as_cond
             T_cond += n_obs_steps
 
         # input embedding stem
@@ -46,7 +41,6 @@ class AutoregressiveTransformer(ModuleAttrMixin):
         self.drop = nn.Dropout(p_drop_emb)
 
         # cond encoder
-        self.time_emb = SinusoidalPosEmb(n_emb)
         self.cond_obs_emb = None
         
         if obs_as_cond:
@@ -120,14 +114,14 @@ class AutoregressiveTransformer(ModuleAttrMixin):
             mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
             self.register_buffer("mask", mask)
             
-            if time_as_cond and obs_as_cond:
+            if obs_as_cond:
                 S = T_cond
                 t, s = torch.meshgrid(
                     torch.arange(T),
                     torch.arange(S),
                     indexing='ij'
                 )
-                mask = t >= (s-1) # add one dimension since time is the first token in cond
+                mask = t >= s
                 mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
                 self.register_buffer('memory_mask', mask)
             else:
@@ -144,7 +138,6 @@ class AutoregressiveTransformer(ModuleAttrMixin):
         self.T = T
         self.T_cond = T_cond
         self.horizon = horizon
-        self.time_as_cond = time_as_cond
         self.obs_as_cond = obs_as_cond
         self.encoder_only = encoder_only
 
@@ -269,51 +262,27 @@ class AutoregressiveTransformer(ModuleAttrMixin):
 
     def forward(self, 
         sample: torch.Tensor, 
-        timestep: Union[torch.Tensor, float, int], 
         cond: Optional[torch.Tensor]=None, **kwargs):
         """
         x: (B,T,input_dim)
-        timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
         output: (B,T,input_dim*vocab_size)
         """
-        # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-        time_emb = self.time_emb(timesteps).unsqueeze(1)
-        # (B,1,n_emb)
-
         # process input
         # print('SAMPLE', sample.shape)
         input_emb = self.input_emb(sample)
         # print('INPUT EMB', input_emb.shape)
 
         if self.encoder_only:
-            # BERT
-            token_embeddings = torch.cat([time_emb, input_emb], dim=1)
-            t = token_embeddings.shape[1]
-            position_embeddings = self.pos_emb[
-                :, :t, :
-            ]  # each position maps to a (learnable) vector
-            x = self.drop(token_embeddings + position_embeddings)
-            # (B,T+1,n_emb)
-            x = self.encoder(src=x, mask=self.mask)
-            # (B,T+1,n_emb)
-            x = x[:,1:,:]
-            # (B,T,n_emb)
+            raise NotImplementedError()
         else:
             # encoder
-            cond_embeddings = time_emb
             if self.obs_as_cond:
                 cond_obs_emb = self.cond_obs_emb(cond)
                 # (B,To,n_emb)
-                cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
+                cond_embeddings = cond_obs_emb
+            else:
+                raise NotImplementedError()
             tc = cond_embeddings.shape[1]
             position_embeddings = self.cond_pos_emb[
                 :, :tc, :
@@ -354,15 +323,12 @@ def test():
         horizon=8,
         n_obs_steps=4,
         # cond_dim=10,
-        causal_attn=True,
-        # time_as_cond=False,
-        # n_cond_layers=4
+        causal_attn=True
     )
     opt = transformer.configure_optimizers()
 
-    timestep = torch.tensor(0)
     sample = torch.zeros((4,8,16))
-    out = transformer(sample, timestep)
+    out = transformer(sample)
     
 
     # GPT with time embedding and obs cond
@@ -378,10 +344,9 @@ def test():
     )
     opt = transformer.configure_optimizers()
     
-    timestep = torch.tensor(0)
     sample = torch.zeros((4,8,16))
     cond = torch.zeros((4,4,10))
-    out = transformer(sample, timestep, cond)
+    out = transformer(sample, cond)
 
     # GPT with time embedding and obs cond and encoder
     transformer = AutoregressiveTransformer(
@@ -391,30 +356,23 @@ def test():
         n_obs_steps=4,
         cond_dim=10,
         causal_attn=True,
-        # time_as_cond=False,
         n_cond_layers=4
     )
     opt = transformer.configure_optimizers()
     
-    timestep = torch.tensor(0)
     sample = torch.zeros((4,8,16))
     cond = torch.zeros((4,4,10))
-    out = transformer(sample, timestep, cond)
+    out = transformer(sample, cond)
 
     # BERT with time embedding token
     transformer = AutoregressiveTransformer(
         input_dim=16,
         output_dim=16,
         horizon=8,
-        n_obs_steps=4,
-        # cond_dim=10,
-        # causal_attn=True,
-        time_as_cond=False,
-        # n_cond_layers=4
+        n_obs_steps=4
     )
     opt = transformer.configure_optimizers()
 
-    timestep = torch.tensor(0)
     sample = torch.zeros((4,8,16))
-    out = transformer(sample, timestep)
+    out = transformer(sample)
 

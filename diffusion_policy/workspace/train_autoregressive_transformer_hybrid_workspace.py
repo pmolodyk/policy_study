@@ -74,9 +74,18 @@ class TrainAutoregressiveTransformerHybridWorkspace(BaseWorkspace):
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
-        # configure validation dataset
+         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+
+        # Sanity check: overfit on small dataset
+        if cfg.training.overfit_debug:
+            # Dunny dataset for debug (Quick overfit)
+            dummyset_tr = torch.utils.data.Subset(dataset, torch.arange(0, 1000))
+            train_dataloader = DataLoader(dummyset_tr, **cfg.dataloader)
+
+            dummyset_val = torch.utils.data.Subset(dataset.get_validation_dataset(), torch.arange(0, 500))
+            val_dataloader = DataLoader(dummyset_val, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -293,7 +302,7 @@ class TrainAutoregressiveTransformerHybridWorkspace(BaseWorkspace):
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
     config_name=pathlib.Path(__file__).stem)
 def main(cfg):
-    workspace = TrainDiffusionTransformerHybridWorkspace(cfg)
+    workspace = TrainAutoregressiveTransformerHybridWorkspace(cfg)
     workspace.run()
 
 if __name__ == "__main__":
